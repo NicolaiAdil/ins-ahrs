@@ -9,8 +9,9 @@
         7.2901076509e-09, 7.2901076509e-09, 7.2901076509e-09,   # accel bias RW
         2.9572436856e-09, 2.9572436856e-09, 2.9572436856e-09,   # gyro white
         2.7515926086e-12, 2.7515926086e-12, 2.7515926086e-12    # gyro bias RW
+
       ]
-      radar_sigma_vr: 0.38    # per-return Doppler noise (m/s)
+      radar_sigma_vr: 0.038    # per-return Doppler noise (m/s)
 
       # Time constants for the bias models, chosen based on the matlab example
       T_acc: 100.0 # Eq. 14.195 in Fossen 2nd edition
@@ -19,9 +20,11 @@
       # Radar -> IMU extrinsic transformation
       l_BR_B: [0.07872, 0.02159, -0.05919] # [x y z]
       q_R_B: [0.9723699204, 0.0, -0.2334453639, 0.0] # [x y z w]
+      # l_BR_B: [0.077, 0.016, -0.063] # xyz
+      # q_R_B: [0.963, -0.021, -0.265, 0.021] # xyzw
 
       # ROS2 PARAMETERS
-      state_estimate_topic: '/state_estimate/revolt' # Publisher
+      state_estimate_topic: '/rio/pose' # Publisher
       imu_topic: '/vectornav_driver_node/imu/data'
       # fix_topic: '/fix'
       # heading_topic: '/heading'
@@ -35,5 +38,7 @@
         velocity:     [1.0e-1, 1.0e-1, 1.0e-1]
         accel_bias:   [1.0e-2, 1.0e-2, 1.0e-2]
         gyro_bias:    [1.0e-2, 1.0e-2, 1.0e-2]
+        p_IR:         [1.0e-3, 1.0e-3, 1.0e-3]
+        theta_IR:     [2.0, 2.0, 2.0] # deg
 
   

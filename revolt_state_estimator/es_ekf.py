@@ -13,7 +13,7 @@ class ErrorState_ExtendedKalmanFilter:
     Extended Kalman Filter with Euler predict + ZOH discretization + numerical Jacobians.
     """
 
-    def __init__(self, Q, P_initial, T_acc, T_ars):
+    def __init__(self, Q, P_initial, T_acc, T_ars, p_IR, theta_IR):
         """
         Error-state model:
         δx_dot = A(t)δx + E(t)w
@@ -28,7 +28,7 @@ class ErrorState_ExtendedKalmanFilter:
         E, ε : Process and measurement noise matrices.
         dt : timestep
         """
-        self.num_states = 15  # Number of states in the error state model
+        self.num_states = 21  # Number of states in the error state model
         self.Q = Q
         self.T_acc = T_acc
         self.T_ars = T_ars
@@ -45,6 +45,12 @@ class ErrorState_ExtendedKalmanFilter:
         self.b_acc_ins = np.zeros((3, 1))  # Body frame accelerometer bias
         self.theta_hat_ins = np.zeros((3, 1))  # Attitude from body to NED frame
         self.b_ars_ins = np.zeros((3, 1))  # Body frame angular rate bias
+        #Convert to numpy arrays
+        self.p_IR = np.array(p_IR).reshape(3,1)     # Radar pos rel to inertial frame
+        self.theta_IR = np.array(theta_IR).reshape(3,1)            # Radar attitude rel to inertial frame
+
+        self.x_hat_ins[15:18] = self.p_IR
+        self.x_hat_ins[18:21] = self.theta_IR
 
         # Error states
         # Posteri error states
@@ -105,6 +111,7 @@ class ErrorState_ExtendedKalmanFilter:
         self.x_hat_ins[:6]  += delta_x_hat[:6]
         self.x_hat_ins[6:9] += delta_x_hat[6:9]     # b_a
         self.x_hat_ins[12:15] += delta_x_hat[12:15] # b_g
+        self.p_IR += delta_x_hat[15:18]        
 
         # multiplicative attitude on SO(3)
         roll, pitch, yaw = self.theta_hat_ins.flatten()
@@ -124,8 +131,27 @@ class ErrorState_ExtendedKalmanFilter:
         # rebuild x_hat_ins angles
         self.x_hat_ins[9:12] = self.theta_hat_ins
 
-        G = np.eye(15)
+        # multiplicative attitude on SO(3)
+        roll_IR, pitch_IR, yaw_IR = self.theta_IR.flatten()
+        R_IR = tf_transformations.euler_matrix(roll_IR, pitch_IR, yaw_IR)[:3, :3]  # R->I
+        dth_IR = delta_x_hat[18:21, 0]
+        # print("dth:", dth.flatten(), "yaw before update:", yaw)
+        R_IR_next = R_IR @ _exp_so3(dth_IR)            # compose rotation
+        R_IR_next = _project_to_SO3(R_IR_next)      # re-orthogonalize
+        # print("R_nb_next det:", np.linalg.det(R_nb_next))
+        # r, p, y = tf_transformations.euler_from_matrix(R_nb_next, axes='szyx')
+        p = -np.arcsin(np.clip(R_IR_next[2,0], -1.0, 1.0))
+        r  = np.arctan2(R_IR_next[2,1], R_IR_next[2,2])
+        y   = np.arctan2(R_IR_next[1,0], R_IR_next[0,0])
+        # print("yaw after update:", y)
+        self.theta_IR[:] = np.array([ssa(r), ssa(p), ssa(y)]).reshape(3,1)
+
+        # rebuild x_hat_ins angles
+        self.x_hat_ins[18:21] = self.theta_IR
+
+        G = np.eye(self.num_states)
         G[9:12,9:12] = np.eye(3) - _skew(0.5 * dth)  # attitude correction
+        G[18:21,18:21] = np.eye(3) - _skew(0.5 * dth_IR)  # attitude correction
         self.P_hat = G @ self.P_hat @ G.T  # Update covariance with attitude correction
 
         self.delta_x_hat = np.zeros(
@@ -141,6 +167,8 @@ class ErrorState_ExtendedKalmanFilter:
 
         self.b_acc_ins = x_hat[6:9]  # Body frame accelerometer bias
         self.b_ars_ins = x_hat[12:15]  # Body frame angular rate
+        self.p_IR = x_hat[15:18]  # Radar position relative to inertial frame
+        self.theta_IR = x_hat[18:21]  # Radar attitude relative to inertial frame
         # p and v is in n-frame
         # p_hat_ins[k+1] = p_hat_ins[k] + dt * v_hat_ins[k]
         # print(f"f_b: {f_imu_b}")
@@ -177,6 +205,8 @@ class ErrorState_ExtendedKalmanFilter:
                 self.b_acc_ins,
                 self.theta_hat_ins,
                 self.b_ars_ins,
+                self.p_IR,
+                self.theta_IR,
             ]
         )
 
@@ -193,11 +223,13 @@ class ErrorState_ExtendedKalmanFilter:
     def generate_A(self, R_nb, T_nb, f_b_nom, w_b_nom):
         O3 = np.zeros((3, 3)); I3 = np.eye(3)
         A = np.block([
-            [O3,  I3,                 O3,                     O3,                 O3],
-            [O3,  O3,              -R_nb, -R_nb @ _skew(f_b_nom),                 O3],
-            [O3,  O3, -(1/self.T_acc)*I3,                     O3,                 O3],
-            [O3,  O3,                 O3,        -_skew(w_b_nom),                -I3],
-            [O3,  O3,                 O3,                     O3, -(1/self.T_ars)*I3],
+            [O3,  I3,                 O3,                     O3,                 O3, O3, O3],
+            [O3,  O3,              -R_nb, -R_nb @ _skew(f_b_nom),                 O3, O3, O3],
+            [O3,  O3, -(1/self.T_acc)*I3,                     O3,                 O3, O3, O3],
+            [O3,  O3,                 O3,        -_skew(w_b_nom),                -I3, O3, O3],
+            [O3,  O3,                 O3,                     O3, -(1/self.T_ars)*I3, O3, O3],
+            [O3,  O3,                 O3,                     O3,                 O3, O3, O3],
+            [O3,  O3,                 O3,                     O3,                 O3, O3, O3],
         ])
         return A
 
@@ -209,6 +241,8 @@ class ErrorState_ExtendedKalmanFilter:
             [   O3,  I3,    O3, O3], 
             [   O3,  O3,   -I3, O3],
             [   O3,  O3,    O3, I3],
+            [   O3,  O3,    O3, O3],
+            [   O3,  O3,    O3, O3],
         ])
         return E
 

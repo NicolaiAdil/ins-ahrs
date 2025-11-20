@@ -23,6 +23,7 @@ from sensor_msgs.msg import Imu, PointCloud2
 from geometry_msgs.msg import (
     TransformStamped,
     Quaternion,
+    Vector3Stamped,
 )
 import tf_transformations
 import tf2_ros
@@ -93,8 +94,9 @@ class RevoltEKF(Node):
         l_BR_B = np.array(_l_BR_B, dtype=float).reshape(3,1)
         self.p_IR = l_BR_B
         qx,qy,qz,qw = _q_R_B
-        self.R_IR = quat_xyzw_to_R(qx,qy,qz,qw)                   # Radar->IMU
-        self.R_RI = self.R_IR.T                     # IMU->Radar
+        self.theta_IR = tf_transformations.euler_from_quaternion([qx,qy,qz,qw], axes='szyx')
+        # self.R_IR = quat_xyzw_to_R(qx,qy,qz,qw)                   # Radar->IMU
+        # self.R_RI = self.R_IR.T                     # IMU->Radar
         self.vr_sign = int(_radar_vr_sign)
         self.sigma_vr = float(_radar_sigma_vr)
 
@@ -117,8 +119,14 @@ class RevoltEKF(Node):
         self.t_start = None
 
         # Error-state Extended Kalman Filter setup
+
         self.es_ekf = ErrorState_ExtendedKalmanFilter(
-            Q=self.Q, P_initial=self.P_hat_initial, T_acc=_T_acc, T_ars=_T_ars
+            Q=self.Q, 
+            P_initial=self.P_hat_initial, 
+            T_acc=_T_acc, 
+            T_ars=_T_ars,
+            p_IR=self.p_IR,
+            theta_IR=self.theta_IR
         )
 
         # ROS2 Interfaces Setup ----------
@@ -135,6 +143,10 @@ class RevoltEKF(Node):
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
         # State publisher
         self.state_pub = self.create_publisher(Odometry, _state_estimate_topic, 10)
+        self.accel_bias_pub = self.create_publisher(Vector3Stamped, "/rio/accel_bias", 10)
+        self.gyro_bias_pub = self.create_publisher(Vector3Stamped, "/rio/gyro_bias", 10)
+        self.p_IR_pub = self.create_publisher(Vector3Stamped, "/rio/radar_position", 10)
+        self.theta_IR_pub = self.create_publisher(Vector3Stamped, "/rio/radar_attitude", 10)
 
         # Debugging ----------
         np.set_printoptions(
@@ -162,7 +174,7 @@ class RevoltEKF(Node):
             f"IMU topic: {_imu_topic} \n"
             f"Radar topic: {_radar_topic} \n"
             f"Extrinsic transformation (l_BR_B): {_l_BR_B} \n"
-            f"Extrinsic transformation (q_R_B): {_q_R_B} \n"
+            f"Extrinsic transformation (theta_R_B): {self.theta_IR} \n"
             f"Radar vr sign: {_radar_vr_sign}      \n"
             f"                                   \n"
         )
@@ -172,7 +184,7 @@ class RevoltEKF(Node):
 
     # Initialize EKF system (STOP) ==================================================
 
-    def _publish_state(self, x, P):
+    def _publish_state(self, x, P, stamp):
 
         # State is a 15‑element vector:
         # x_hat_ins = [
@@ -191,22 +203,27 @@ class RevoltEKF(Node):
             x[10],
             x[11],
         )  # attitude Euler angles: roll, pitch, yaw (rad)
+        b_acc = x[6:9]    # accelerometer biases (m/s²)
+        b_gyro = x[12:15]  # gyroscope biases (rad/s)
+        p_IR = x[15:18]    # radar position rel to inertial frame
+        theta_IR = x[18:21]  # radar attitude rel to inertial frame
+
         # Broadcast NED → imu TF
         t = TransformStamped()
-        t.header.stamp = self.get_clock().now().to_msg()
+        t.header.stamp = stamp
         t.header.frame_id = "ned"
         t.child_frame_id = "body"
         t.transform.translation.x = float(x_pos)
         t.transform.translation.y = float(y_pos)
         t.transform.translation.z = float(z_pos)
         # yaw → quaternion
-        q = tf_transformations.quaternion_from_euler(roll, pitch, yaw)
+        q = tf_transformations.quaternion_from_euler(roll, pitch, yaw, axes='szyx')
         t.transform.rotation = Quaternion(x=q[0], y=q[1], z=q[2], w=q[3])
         self.tf_broadcaster.sendTransform(t)
 
         # 3) Publish ekf/state as Odometry 
         state = Odometry()
-        state.header.stamp = t.header.stamp
+        state.header.stamp = stamp
         state.header.frame_id = "ned"
         state.child_frame_id = "body"
 
@@ -214,7 +231,7 @@ class RevoltEKF(Node):
         state.pose.pose.position.y = float(y_pos)
         state.pose.pose.position.z = float(z_pos)
 
-        qx, qy, qz, qw = tf_transformations.quaternion_from_euler(roll, pitch, yaw)
+        qx, qy, qz, qw = tf_transformations.quaternion_from_euler(roll, pitch, yaw, axes='szyx')
         state.pose.pose.orientation.x  = float(qx)
         state.pose.pose.orientation.y  = float(qy)
         state.pose.pose.orientation.z  = float(qz)
@@ -243,6 +260,40 @@ class RevoltEKF(Node):
         state.twist.covariance = velocity_cov.flatten().tolist()
 
         self.state_pub.publish(state)
+
+        # Publish accel and gyro biases
+        accel_bias_msg = Vector3Stamped()
+        accel_bias_msg.header.stamp = stamp
+        accel_bias_msg.header.frame_id = "body"
+        accel_bias_msg.vector.x = float(b_acc[0])
+        accel_bias_msg.vector.y = float(b_acc[1])
+        accel_bias_msg.vector.z = float(b_acc[2])
+        self.accel_bias_pub.publish(accel_bias_msg)
+
+        gyro_bias_msg = Vector3Stamped()
+        gyro_bias_msg.header.stamp = stamp
+        gyro_bias_msg.header.frame_id = "body"
+        gyro_bias_msg.vector.x = float(b_gyro[0])
+        gyro_bias_msg.vector.y = float(b_gyro[1])
+        gyro_bias_msg.vector.z = float(b_gyro[2])
+        self.gyro_bias_pub.publish(gyro_bias_msg)
+
+        # Publish radar position and attitude
+        p_IR_msg = Vector3Stamped()
+        p_IR_msg.header.stamp = stamp
+        p_IR_msg.header.frame_id = "body"
+        p_IR_msg.vector.x = float(p_IR[0])
+        p_IR_msg.vector.y = float(p_IR[1])
+        p_IR_msg.vector.z = float(p_IR[2])
+        self.p_IR_pub.publish(p_IR_msg)
+
+        theta_IR_msg = Vector3Stamped()
+        theta_IR_msg.header.stamp = stamp
+        theta_IR_msg.header.frame_id = "body"
+        theta_IR_msg.vector.x = float(theta_IR[0])
+        theta_IR_msg.vector.y = float(theta_IR[1])
+        theta_IR_msg.vector.z = float(theta_IR[2])
+        self.theta_IR_pub.publish(theta_IR_msg)
 
     # EKF main loop. The ES-EKF runs at the frequency of the IMU.
     def imu_callback(self, msg: Imu):
@@ -391,10 +442,14 @@ class RevoltEKF(Node):
                 R_WI = Rzyx(r, p, y)      # WRI
                 v_WI = self.es_ekf.v_hat_ins.reshape(3,1)  # WvWI
 
+                p_IR = self.es_ekf.p_IR.reshape(3,1)
+                r, p, y = self.es_ekf.theta_IR.flatten()
+                R_IR = tf_transformations.euler_matrix(r, p, y, axes='szyx')[:3, :3]  # R->I
+
                 # self.get_logger().info(f"Radar vel measurement: {vr}, bearing unit vector: {mu_r}")
                 # Calculate H
-                H = self.calculate_radar_H(mu_r, R_WI, v_WI)
-                h = self.calculate_radar_h(mu_r, R_WI, v_WI, w_b - self.es_ekf.b_ars_ins)
+                H = self.calculate_radar_H(mu_r, R_WI, v_WI, w_b, self.es_ekf.b_ars_ins, p_IR, R_IR)
+                h = self.calculate_radar_h(mu_r, R_WI, v_WI, w_b, self.es_ekf.b_ars_ins, p_IR, R_IR)
                 e = np.array([[self.vr_sign * vr]]) - h
 
                 self.e_mean += e.item()
@@ -454,7 +509,7 @@ class RevoltEKF(Node):
             # No aiding measurements
             self.es_ekf.P_hat = self.es_ekf.P_hat_prior
         # Publish the state estimate
-        self._publish_state(self.es_ekf.x_hat_ins, self.es_ekf.P_hat)
+        self._publish_state(self.es_ekf.x_hat_ins, self.es_ekf.P_hat, msg.header.stamp)
 
     def update_radar(self, msg: PointCloud2, min_range=1e-2):
         """Extract bearing unit vectors (in radar frame R) and per-return radial speeds."""
@@ -480,13 +535,12 @@ class RevoltEKF(Node):
 
         self.new_velocity_measurement = True
 
-    def calculate_radar_H(self, mu_r, R_WI, v_WI):
+    def calculate_radar_H(self, mu_r, R_WI, v_WI, w_imu, b_ars_ins, p_IR, R_IR):
         # 2) State rotations
         R_IW = R_WI.T                      # IRW
-        R_RI = self.R_IR.T                  # RRI
-        assert np.allclose(self.R_IR @ self.R_RI, np.eye(3), atol=1e-6)
-
-        p_IR = self.p_IR                # IpIR, expressed in I
+        R_RI = R_IR.T                      # RRI
+        # w_imu = w_imu - b_ars_ins
+        assert np.allclose(R_IR @ R_RI, np.eye(3), atol=1e-6)
 
         # 3) Predicted radar linear velocity per Eq. (8): v_R = R_RI( R_IW v_W + (w_I)× p_IR )
         # v_I  = R_IW @ v_WI                              # WR^T_I WvWI  == R_IW v_W
@@ -494,7 +548,7 @@ class RevoltEKF(Node):
 
         # 5) Build Jacobian H per Eq. (10)
         # State order: [p(0:3), v(3:6), b_a(6:9), eul(9:12), b_g(12:15)]
-        H = np.zeros((1, 15), dtype=np.float64)
+        H = np.zeros((1, 21), dtype=np.float64)
 
         # d e / d v_W = - μ^T R_RI R_IW    (Eq. 10)
         H[0, 3:6] = -(mu_r.reshape(1,3) @ (R_RI @ R_IW))
@@ -507,16 +561,32 @@ class RevoltEKF(Node):
         v_I = R_IW @ v_WI                     # (IRW WvWI)
         S = -(mu_r.reshape(1,3) @ (R_RI @ _skew(v_I.flatten())))   # shape (1,3)
         H[0, 9:12] = S
+
+        # d e / d p_IR 
+        H[0, 15:18] = -(mu_r.reshape(1,3) @ (R_RI @ (_skew((w_imu).flatten())-_skew(b_ars_ins.flatten()))))
+
+        # d e / d b_g = 0
+        H[0, 18:21] = -(mu_r.reshape(1,3) @ (R_RI @
+                                        (
+                                           _skew(R_RI @ R_IW @ v_WI.flatten()) 
+                                         + _skew(R_RI @ np.cross(w_imu.flatten(), p_IR.flatten()).flatten())
+                                         - _skew(R_RI @ np.cross(b_ars_ins.flatten(), p_IR.flatten()).flatten())
+                                        )
+                                    )
+                        )
         # print(f"Radar H: {H}")
         return H
-    
-    def calculate_radar_h(self, mu_r, R_WI, v_WI, w_imu):
+
+    def calculate_radar_h(self, mu_r, R_WI, v_WI, w_imu, b_ars_ins, p_IR, R_IR):
         R_IW = R_WI.T
+        R_RI = R_IR.T
         v_I  = R_IW @ v_WI
+
+        # w_imu = w_imu - b_ars_ins
         # print(f"v_I: {v_I.flatten()}")
-        spin = np.cross(w_imu.flatten(), self.p_IR.flatten()).reshape(3,1)
+        spin = np.cross(w_imu.flatten(), p_IR.flatten()).reshape(3,1)
         # print(f"spin: {spin.flatten()}")
-        v_R  = self.R_RI @ (v_I + spin)
+        v_R  = R_RI @ (v_I + spin)
         return float(-(mu_r.reshape(1,3) @ v_R))
     
     def get_initial_P(self):
@@ -525,24 +595,31 @@ class RevoltEKF(Node):
         self.declare_parameter("revolt_ekf.initial_sigma.velocity",     [1.0e-1, 1.0e-1, 1.0e-1])
         self.declare_parameter("revolt_ekf.initial_sigma.accel_bias",   [1.0e-2, 1.0e-2, 1.0e-2])
         self.declare_parameter("revolt_ekf.initial_sigma.gyro_bias",    [1.0e-2, 1.0e-2, 1.0e-2])
+        self.declare_parameter("revolt_ekf.initial_sigma.p_IR",         [1.0e-2, 1.0e-2, 1.0e-2])
+        self.declare_parameter("revolt_ekf.initial_sigma.theta_IR",     [6.0, 6.0, 6.0])
 
         sig_att_deg = np.array(self.get_parameter("revolt_ekf.initial_sigma.attitude_deg").value, dtype=float)
         sig_pos     = np.array(self.get_parameter("revolt_ekf.initial_sigma.position").value,     dtype=float)
         sig_vel     = np.array(self.get_parameter("revolt_ekf.initial_sigma.velocity").value,     dtype=float)
         sig_ba      = np.array(self.get_parameter("revolt_ekf.initial_sigma.accel_bias").value,   dtype=float)
         sig_bg      = np.array(self.get_parameter("revolt_ekf.initial_sigma.gyro_bias").value,    dtype=float)
+        sig_p_IR    = np.array(self.get_parameter("revolt_ekf.initial_sigma.p_IR").value,         dtype=float)
+        sig_theta_IR= np.array(self.get_parameter("revolt_ekf.initial_sigma.theta_IR").value,     dtype=float)
 
         # Convert attitude to radians
         sig_att = np.deg2rad(sig_att_deg)
+        sig_theta_IR = np.deg2rad(sig_theta_IR)
 
         # Build 15x15 P in your state order:
         # δx = [δp(0:3), δv(3:6), δb_a(6:9), δθ(9:12), δb_g(12:15)]
-        P_init = np.zeros((15, 15), dtype=np.float64)
+        P_init = np.zeros((21, 21), dtype=np.float64)
         P_init[0:3,   0:3]   = np.diag(sig_pos**2)   # position
         P_init[3:6,   3:6]   = np.diag(sig_vel**2)   # velocity
         P_init[6:9,   6:9]   = np.diag(sig_ba**2)    # accel bias
         P_init[9:12,  9:12]  = np.diag(sig_att**2)   # attitude (rad)
         P_init[12:15,12:15]  = np.diag(sig_bg**2)    # gyro bias
+        P_init[15:18,15:18]  = np.diag(sig_p_IR**2)  # radar position
+        P_init[18:21,18:21]  = np.diag(sig_theta_IR**2)  # radar attitude
 
         return P_init
 

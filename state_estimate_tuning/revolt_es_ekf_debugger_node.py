@@ -11,6 +11,13 @@ Also shows:
 - Velocity panel: EKF only (truth PoseStamped has no velocity)
 
 Each series has its own timestamps to avoid compressing the visible time window.
+
+Also plots radar extrinsics (position and attitude of radar w.r.t. IMU/body) over time:
+- /rio/radar_position  (Vector3Stamped)  [m]
+- /rio/radar_attitude  (Vector3Stamped)  [rad, ZYX]
+with ground-truth constants:
+- l_BR_B = [0.077, 0.016, -0.063]
+- q_R_B  = [0.963, -0.021, -0.265, 0.021] (xyzw, converted with axes='szyx')
 """
 
 from collections import deque
@@ -18,7 +25,7 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from nav_msgs.msg import Odometry
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, Vector3Stamped
 import tf_transformations
 import matplotlib.pyplot as plt
 import time
@@ -66,19 +73,37 @@ class EKFDebugPlotter(Node):
         super().__init__('ekf_debug_plotter')
 
         # Parameters
-        self.declare_parameter('topic_state', '/state_estimate/revolt')
+        self.declare_parameter('topic_state', '/rio/pose')
         self.declare_parameter('topic_truth_pose', '/lio/pose')
         self.declare_parameter('truth_frame', 'NED')  # 'ENU' or 'NED'
         self.declare_parameter('window_secs', 300.0)
         self.declare_parameter('plot_rate_hz', 5.0)
         self.declare_parameter('flip_warn_thresh_deg', 150.0)
 
+        # Radar extrinsics topics
+        self.declare_parameter('topic_radar_pos', '/rio/radar_position')
+        self.declare_parameter('topic_radar_att', '/rio/radar_attitude')
+
         self.topic_state = self.get_parameter('topic_state').value
         self.topic_truth_pose = self.get_parameter('topic_truth_pose').value
         self.truth_frame = str(self.get_parameter('truth_frame').value).upper()
         self.window_secs = float(self.get_parameter('window_secs').value)
         self.plot_dt = 1.0 / float(self.get_parameter('plot_rate_hz').value)
-        self.flip_warn_thresh = np.deg2rad(float(self.get_parameter('flip_warn_thresh_deg').value))
+        self.flip_warn_thresh = np.deg2rad(
+            float(self.get_parameter('flip_warn_thresh_deg').value)
+        )
+
+        self.topic_radar_pos = self.get_parameter('topic_radar_pos').value
+        self.topic_radar_att = self.get_parameter('topic_radar_att').value
+
+        # Ground-truth radar extrinsics (body frame)
+        self.radar_pos_true = np.array([0.077, 0.016, -0.063], dtype=float)
+        q_R_B = [0.963, -0.021, -0.265, 0.021]  # xyzw
+        # Use ZYX to match your EKF (Rzyx)
+        self.radar_att_true_rad = np.array(
+            tf_transformations.euler_from_quaternion(q_R_B, axes='szyx'),
+            dtype=float
+        )
 
         # Time zero
         self.t0 = None
@@ -96,7 +121,7 @@ class EKFDebugPlotter(Node):
         self.t_z_est, self.z_est_hist = deque(), deque()
         self.t_z_truth, self.z_truth_hist = deque(), deque()
 
-        # Velocities (EKF only here)
+        # Velocities (EKF only)
         self.t_vN_est, self.vN_est = deque(), deque()
         self.t_vE_est, self.vE_est = deque(), deque()
 
@@ -111,19 +136,31 @@ class EKFDebugPlotter(Node):
         self._last_yaw_est = None
         self._last_yaw_truth = None
 
+        # Radar extrinsics histories
+        self.t_rpos = deque()
+        self.rpos_x, self.rpos_y, self.rpos_z = deque(), deque(), deque()
+
+        self.t_ratt = deque()
+        self.ratt_roll, self.ratt_pitch, self.ratt_yaw = deque(), deque(), deque()
+
         # Subscribers
         self.create_subscription(Odometry, self.topic_state, self.cb_state, 10)
         self.create_subscription(PoseStamped, self.topic_truth_pose, self.cb_truth_pose, 10)
+        self.create_subscription(Vector3Stamped, self.topic_radar_pos, self.cb_radar_pos, 10)
+        self.create_subscription(Vector3Stamped, self.topic_radar_att, self.cb_radar_att, 10)
 
-        # Figure + timer
-        self._make_figure()
+        # Figures + timer
+        self._make_figure_main()
+        self._make_figure_extrinsics()
         self._plot_timer = self.create_timer(self.plot_dt, self._on_plot_timer)
 
         self.get_logger().info(
             "EKF Debug Plotter started.\n"
             f" Subscribed to:\n"
-            f"  state:     {self.topic_state}\n"
-            f"  truthPose: {self.topic_truth_pose}  (frame={self.truth_frame})\n"
+            f"  state:           {self.topic_state}\n"
+            f"  truthPose:       {self.topic_truth_pose}  (frame={self.truth_frame})\n"
+            f"  radar_position:  {self.topic_radar_pos}\n"
+            f"  radar_attitude:  {self.topic_radar_att}\n"
             f" Window = {self.window_secs}s, plot_rate = {1.0 / self.plot_dt:.1f} Hz"
         )
 
@@ -137,9 +174,9 @@ class EKFDebugPlotter(Node):
     def cb_state(self, msg: Odometry):
         t = self._now_s()
 
-        # EKF orientation (RPY in NED)
+        # EKF orientation (RPY in NED) – uses tf default (sxyz) for consistency with Odometry
         q = msg.pose.pose.orientation
-        r, p, y = tf_transformations.euler_from_quaternion([q.x, q.y, q.z, q.w])
+        r, p, y = tf_transformations.euler_from_quaternion([q.x, q.y, q.z, q.w], axes='szyx')
         r, p, y = ssa(r), ssa(p), ssa(y)
 
         # Save yaw (unwrapped), roll, pitch
@@ -194,11 +231,39 @@ class EKFDebugPlotter(Node):
             diff = ssa(self.yaw_truth_hist[-1] - self.yaw_est_hist[-1])
             if abs(abs(diff) - np.pi) < np.deg2rad(15) or abs(diff) > self.flip_warn_thresh:
                 self._append_limited(self.flip_marks_t, t)
-                self.get_logger().warn(f"Possible 180° flip: |Δyaw|={np.degrees(abs(diff)):.1f}° at t={t:.1f}s")
+                self.get_logger().warn(
+                    f"Possible 180° flip: |Δyaw|={np.degrees(abs(diff)):.1f}° at t={t:.1f}s"
+                )
+
+    def cb_radar_pos(self, msg: Vector3Stamped):
+        t = self._now_s()
+        # 3-vector position in body frame
+        self.t_rpos.append(float(t))
+        self.rpos_x.append(float(msg.vector.x))
+        self.rpos_y.append(float(msg.vector.y))
+        self.rpos_z.append(float(msg.vector.z))
+        if len(self.t_rpos) > 5000:
+            self.t_rpos.popleft()
+            self.rpos_x.popleft()
+            self.rpos_y.popleft()
+            self.rpos_z.popleft()
+
+    def cb_radar_att(self, msg: Vector3Stamped):
+        t = self._now_s()
+        # 3-vector Euler (ZYX) in radians in body frame
+        self.t_ratt.append(float(t))
+        self.ratt_roll.append(float(msg.vector.x))
+        self.ratt_pitch.append(float(msg.vector.y))
+        self.ratt_yaw.append(float(msg.vector.z))
+        if len(self.t_ratt) > 5000:
+            self.t_ratt.popleft()
+            self.ratt_roll.popleft()
+            self.ratt_pitch.popleft()
+            self.ratt_yaw.popleft()
 
     # ----------------------- Plotting -----------------------
 
-    def _make_figure(self):
+    def _make_figure_main(self):
         plt.ion()
         self.fig = plt.figure(figsize=(12, 14))
         # Extra row for Z plot
@@ -221,7 +286,6 @@ class EKFDebugPlotter(Node):
         self.ax_rp.set_title("Roll & Pitch vs Time")
         self.ax_rp.set_ylabel("Angle [deg]")
         self.ax_rp.set_xlabel("Time [s]")
-        # EKF thin, LIO thicker
         self.l_roll_est, = self.ax_rp.plot([], [], label="EKF roll", linewidth=1.2)
         self.l_pitch_est, = self.ax_rp.plot([], [], label="EKF pitch", linewidth=1.2)
         self.l_roll_truth, = self.ax_rp.plot([], [], label="LIO roll", linewidth=2.4)
@@ -262,6 +326,47 @@ class EKFDebugPlotter(Node):
 
         self.fig.canvas.draw()
         self.fig.canvas.flush_events()
+        try:
+            plt.show(block=False)
+        except Exception:
+            pass
+
+    def _make_figure_extrinsics(self):
+        # Second figure for radar extrinsics
+        self.fig_ext, (self.ax_rpos, self.ax_ratt) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+        self.fig_ext.subplots_adjust(hspace=0.35)
+
+        # Radar translation
+        self.ax_rpos.set_title("Radar Translation Extrinsics vs Time (body frame)")
+        self.ax_rpos.set_ylabel("Position [m]")
+        # EKF estimates
+        self.l_rpos_x_est, = self.ax_rpos.plot([], [], label="EKF p_rx")
+        self.l_rpos_y_est, = self.ax_rpos.plot([], [], label="EKF p_ry")
+        self.l_rpos_z_est, = self.ax_rpos.plot([], [], label="EKF p_rz")
+        # Ground truth lines
+        self.l_rpos_x_gt, = self.ax_rpos.plot([], [], linestyle='--', label="GT p_rx")
+        self.l_rpos_y_gt, = self.ax_rpos.plot([], [], linestyle='--', label="GT p_ry")
+        self.l_rpos_z_gt, = self.ax_rpos.plot([], [], linestyle='--', label="GT p_rz")
+        self.ax_rpos.grid(True)
+        self.ax_rpos.legend(loc='best')
+
+        # Radar attitude
+        self.ax_ratt.set_title("Radar Rotation Extrinsics vs Time (body frame, ZYX)")
+        self.ax_ratt.set_ylabel("Angle [deg]")
+        self.ax_ratt.set_xlabel("Time [s]")
+        # EKF estimates
+        self.l_ratt_r_est, = self.ax_ratt.plot([], [], label="EKF roll_r")
+        self.l_ratt_p_est, = self.ax_ratt.plot([], [], label="EKF pitch_r")
+        self.l_ratt_y_est, = self.ax_ratt.plot([], [], label="EKF yaw_r")
+        # Ground truth lines
+        self.l_ratt_r_gt, = self.ax_ratt.plot([], [], linestyle='--', label="GT roll_r")
+        self.l_ratt_p_gt, = self.ax_ratt.plot([], [], linestyle='--', label="GT pitch_r")
+        self.l_ratt_y_gt, = self.ax_ratt.plot([], [], linestyle='--', label="GT yaw_r")
+        self.ax_ratt.grid(True)
+        self.ax_ratt.legend(loc='best')
+
+        self.fig_ext.canvas.draw()
+        self.fig_ext.canvas.flush_events()
         try:
             plt.show(block=False)
         except Exception:
@@ -373,8 +478,69 @@ class EKFDebugPlotter(Node):
         self.ax_vel.relim()
         self.ax_vel.autoscale_view(scalex=False, scaley=True)
 
+        # ---- Radar extrinsics ----
+        # Translation
+        if len(self.t_rpos) > 0:
+            t_rpos = np.asarray(self.t_rpos, dtype=float)
+            mask = (t_rpos >= tmin) & (t_rpos <= tmax)
+            t_rpos_w = t_rpos[mask]
+            rx = np.asarray(self.rpos_x, dtype=float)[mask]
+            ry = np.asarray(self.rpos_y, dtype=float)[mask]
+            rz = np.asarray(self.rpos_z, dtype=float)[mask]
+
+            self.l_rpos_x_est.set_data(t_rpos_w, rx)
+            self.l_rpos_y_est.set_data(t_rpos_w, ry)
+            self.l_rpos_z_est.set_data(t_rpos_w, rz)
+
+            # GT lines over same support
+            self.l_rpos_x_gt.set_data(t_rpos_w, np.full_like(t_rpos_w, self.radar_pos_true[0]))
+            self.l_rpos_y_gt.set_data(t_rpos_w, np.full_like(t_rpos_w, self.radar_pos_true[1]))
+            self.l_rpos_z_gt.set_data(t_rpos_w, np.full_like(t_rpos_w, self.radar_pos_true[2]))
+
+            self.ax_rpos.set_xlim([tmin, tmax])
+            self.ax_rpos.relim()
+            self.ax_rpos.autoscale_view(scalex=False, scaley=True)
+        else:
+            self.l_rpos_x_est.set_data([], [])
+            self.l_rpos_y_est.set_data([], [])
+            self.l_rpos_z_est.set_data([], [])
+            self.l_rpos_x_gt.set_data([], [])
+            self.l_rpos_y_gt.set_data([], [])
+            self.l_rpos_z_gt.set_data([], [])
+
+        # Attitude (deg)
+        if len(self.t_ratt) > 0:
+            t_ratt = np.asarray(self.t_ratt, dtype=float)
+            mask = (t_ratt >= tmin) & (t_ratt <= tmax)
+            t_ratt_w = t_ratt[mask]
+            rr = np.degrees(np.asarray(self.ratt_roll, dtype=float)[mask])
+            rp = np.degrees(np.asarray(self.ratt_pitch, dtype=float)[mask])
+            ryaw = np.degrees(np.asarray(self.ratt_yaw, dtype=float)[mask])
+
+            self.l_ratt_r_est.set_data(t_ratt_w, rr)
+            self.l_ratt_p_est.set_data(t_ratt_w, rp)
+            self.l_ratt_y_est.set_data(t_ratt_w, ryaw)
+
+            gt_deg = np.degrees(self.radar_att_true_rad)
+            self.l_ratt_r_gt.set_data(t_ratt_w, np.full_like(t_ratt_w, gt_deg[0]))
+            self.l_ratt_p_gt.set_data(t_ratt_w, np.full_like(t_ratt_w, gt_deg[1]))
+            self.l_ratt_y_gt.set_data(t_ratt_w, np.full_like(t_ratt_w, gt_deg[2]))
+
+            self.ax_ratt.set_xlim([tmin, tmax])
+            self.ax_ratt.relim()
+            self.ax_ratt.autoscale_view(scalex=False, scaley=True)
+        else:
+            self.l_ratt_r_est.set_data([], [])
+            self.l_ratt_p_est.set_data([], [])
+            self.l_ratt_y_est.set_data([], [])
+            self.l_ratt_r_gt.set_data([], [])
+            self.l_ratt_p_gt.set_data([], [])
+            self.l_ratt_y_gt.set_data([], [])
+
         self.fig.canvas.draw_idle()
         self.fig.canvas.flush_events()
+        self.fig_ext.canvas.draw_idle()
+        self.fig_ext.canvas.flush_events()
 
     # ----------------------- Helpers -----------------------
 
