@@ -39,6 +39,6 @@
         accel_bias:   [1.0e-2, 1.0e-2, 1.0e-2]
         gyro_bias:    [1.0e-2, 1.0e-2, 1.0e-2]
         p_IR:         [1.0e-6, 1.0e-6, 1.0e-6]
-        theta_IR:     [0.5, 0.5, 0.5] # deg
+        theta_IR:     [1.0e-2, 1.0e-2, 1.0e-2] # deg
 
   

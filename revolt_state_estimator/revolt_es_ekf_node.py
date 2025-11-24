@@ -312,6 +312,8 @@ class RevoltEKF(Node):
         if not self.initialized:
             return
 
+        t0 = self.get_clock().now()
+
         f_b = np.array([[msg.linear_acceleration.x],
                         [msg.linear_acceleration.y],
                         [msg.linear_acceleration.z]], dtype=float)
@@ -452,7 +454,18 @@ class RevoltEKF(Node):
             # No aiding measurements
             self.es_ekf.P_hat = self.es_ekf.P_hat_prior
         # Publish the state estimate
-        self._publish_state(self.es_ekf.x_hat_ins, self.es_ekf.P_hat, msg.header.stamp)
+        t1 = self.get_clock().now()
+        diff_time = t1 - t0
+        self.get_logger().info(f"EKF IMU callback time: {diff_time.nanoseconds * 1e-6:.3f} ms")
+
+        msg_stamp = rclpy.time.Time(
+            seconds=msg.header.stamp.sec,
+            nanoseconds=msg.header.stamp.nanosec,
+        )
+
+        stamp_time = msg_stamp + diff_time  # this is a rclpy.time.Time
+
+        self._publish_state(self.es_ekf.x_hat_ins, self.es_ekf.P_hat, stamp_time.to_msg())
 
     def update_radar(self, msg: PointCloud2, min_range=1e-2):
         """Extract bearing unit vectors (in radar frame R) and per-return radial speeds."""
@@ -506,15 +519,15 @@ class RevoltEKF(Node):
         H[0, 9:12] = S
 
         # d e / d p_IR
-        # H[0, 15:18] = -(mu_r.reshape(1,3) @ (R_RI @ ( _skew((w_imu).flatten()) ) ))
+        H[0, 15:18] = -(mu_r.reshape(1,3) @ (R_RI @ ( _skew((w_imu).flatten()) ) ))
 
-        # # d e / d b_g = 0
-        # H[0, 18:21] = -(mu_r.reshape(1,3) @ (R_RI @
-        #                                 (
-        #                                 _skew(R_RI @ (R_IW @ v_WI.flatten() + np.cross(w_imu.flatten(), p_IR.flatten())))
-        #                                 )
-        #                             )
-        #                 )
+        # d e / d b_g = 0
+        H[0, 18:21] = -(mu_r.reshape(1,3) @ (R_RI @
+                                        (
+                                        _skew(R_RI @ (v_I.flatten() + np.cross(w_imu.flatten(), p_IR.flatten())))
+                                        )
+                                    )
+                        )
         # print(f"Radar H: {H}")
         return H
 
