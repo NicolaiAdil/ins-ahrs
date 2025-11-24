@@ -14,10 +14,10 @@ Each series has its own timestamps to avoid compressing the visible time window.
 
 Also plots radar extrinsics (position and attitude of radar w.r.t. IMU/body) over time:
 - /rio/radar_position  (Vector3Stamped)  [m]
-- /rio/radar_attitude  (Vector3Stamped)  [rad, ZYX]
+- /rio/radar_attitude  (QuaternionStamped)  [rad, xyz]
 with ground-truth constants:
 - l_BR_B = [0.077, 0.016, -0.063]
-- q_R_B  = [0.963, -0.021, -0.265, 0.021] (xyzw, converted with axes='szyx')
+- q_R_B  = [0.963, -0.021, -0.265, 0.021] (xyzw, converted with axes='sxyz')
 """
 
 from collections import deque
@@ -25,7 +25,7 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from nav_msgs.msg import Odometry
-from geometry_msgs.msg import PoseStamped, Vector3Stamped
+from geometry_msgs.msg import PoseStamped, Vector3Stamped, QuaternionStamped
 import tf_transformations
 import matplotlib.pyplot as plt
 import time
@@ -99,9 +99,9 @@ class EKFDebugPlotter(Node):
         # Ground-truth radar extrinsics (body frame)
         self.radar_pos_true = np.array([0.077, 0.016, -0.063], dtype=float)
         q_R_B = [0.963, -0.021, -0.265, 0.021]  # xyzw
-        # Use ZYX to match your EKF (Rzyx)
+
         self.radar_att_true_rad = np.array(
-            tf_transformations.euler_from_quaternion(q_R_B, axes='szyx'),
+            tf_transformations.euler_from_quaternion(q_R_B, axes='sxyz'),
             dtype=float
         )
 
@@ -147,7 +147,7 @@ class EKFDebugPlotter(Node):
         self.create_subscription(Odometry, self.topic_state, self.cb_state, 10)
         self.create_subscription(PoseStamped, self.topic_truth_pose, self.cb_truth_pose, 10)
         self.create_subscription(Vector3Stamped, self.topic_radar_pos, self.cb_radar_pos, 10)
-        self.create_subscription(Vector3Stamped, self.topic_radar_att, self.cb_radar_att, 10)
+        self.create_subscription(QuaternionStamped, self.topic_radar_att, self.cb_radar_att, 10)
 
         # Figures + timer
         self._make_figure_main()
@@ -176,7 +176,7 @@ class EKFDebugPlotter(Node):
 
         # EKF orientation (RPY in NED) – uses tf default (sxyz) for consistency with Odometry
         q = msg.pose.pose.orientation
-        r, p, y = tf_transformations.euler_from_quaternion([q.x, q.y, q.z, q.w], axes='szyx')
+        r, p, y = tf_transformations.euler_from_quaternion([q.x, q.y, q.z, q.w], axes='sxyz')
         r, p, y = ssa(r), ssa(p), ssa(y)
 
         # Save yaw (unwrapped), roll, pitch
@@ -248,13 +248,22 @@ class EKFDebugPlotter(Node):
             self.rpos_y.popleft()
             self.rpos_z.popleft()
 
-    def cb_radar_att(self, msg: Vector3Stamped):
+    def cb_radar_att(self, msg: QuaternionStamped):
         t = self._now_s()
-        # 3-vector Euler (ZYX) in radians in body frame
+
+        # Quaternion of radar attitude in body frame (xyzw)
+        q = msg.quaternion
+        q_xyzw = [q.x, q.y, q.z, q.w]
+
+        roll_r, pitch_r, yaw_r = tf_transformations.euler_from_quaternion(
+            q_xyzw, axes='sxyz'
+        )
+
         self.t_ratt.append(float(t))
-        self.ratt_roll.append(float(msg.vector.x))
-        self.ratt_pitch.append(float(msg.vector.y))
-        self.ratt_yaw.append(float(msg.vector.z))
+        self.ratt_roll.append(float(roll_r))
+        self.ratt_pitch.append(float(pitch_r))
+        self.ratt_yaw.append(float(yaw_r))
+
         if len(self.t_ratt) > 5000:
             self.t_ratt.popleft()
             self.ratt_roll.popleft()
@@ -339,29 +348,35 @@ class EKFDebugPlotter(Node):
         # Radar translation
         self.ax_rpos.set_title("Radar Translation Extrinsics vs Time (body frame)")
         self.ax_rpos.set_ylabel("Position [m]")
-        # EKF estimates
-        self.l_rpos_x_est, = self.ax_rpos.plot([], [], label="EKF p_rx")
-        self.l_rpos_y_est, = self.ax_rpos.plot([], [], label="EKF p_ry")
-        self.l_rpos_z_est, = self.ax_rpos.plot([], [], label="EKF p_rz")
-        # Ground truth lines
-        self.l_rpos_x_gt, = self.ax_rpos.plot([], [], linestyle='--', label="GT p_rx")
-        self.l_rpos_y_gt, = self.ax_rpos.plot([], [], linestyle='--', label="GT p_ry")
-        self.l_rpos_z_gt, = self.ax_rpos.plot([], [], linestyle='--', label="GT p_rz")
+
+        # Use same colors per component: x=C0, y=C1, z=C2
+        # EKF estimates (solid)
+        self.l_rpos_x_est, = self.ax_rpos.plot([], [], label="EKF p_rx", color='C0', linestyle='-')
+        self.l_rpos_y_est, = self.ax_rpos.plot([], [], label="EKF p_ry", color='C1', linestyle='-')
+        self.l_rpos_z_est, = self.ax_rpos.plot([], [], label="EKF p_rz", color='C2', linestyle='-')
+        # Ground truth (dashed, same colors)
+        self.l_rpos_x_gt,  = self.ax_rpos.plot([], [], label="GT p_rx",  color='C0', linestyle='--')
+        self.l_rpos_y_gt,  = self.ax_rpos.plot([], [], label="GT p_ry",  color='C1', linestyle='--')
+        self.l_rpos_z_gt,  = self.ax_rpos.plot([], [], label="GT p_rz",  color='C2', linestyle='--')
+
         self.ax_rpos.grid(True)
         self.ax_rpos.legend(loc='best')
 
         # Radar attitude
-        self.ax_ratt.set_title("Radar Rotation Extrinsics vs Time (body frame, ZYX)")
+        self.ax_ratt.set_title("Radar Rotation Extrinsics vs Time (body frame, xyz)")
         self.ax_ratt.set_ylabel("Angle [deg]")
         self.ax_ratt.set_xlabel("Time [s]")
-        # EKF estimates
-        self.l_ratt_r_est, = self.ax_ratt.plot([], [], label="EKF roll_r")
-        self.l_ratt_p_est, = self.ax_ratt.plot([], [], label="EKF pitch_r")
-        self.l_ratt_y_est, = self.ax_ratt.plot([], [], label="EKF yaw_r")
-        # Ground truth lines
-        self.l_ratt_r_gt, = self.ax_ratt.plot([], [], linestyle='--', label="GT roll_r")
-        self.l_ratt_p_gt, = self.ax_ratt.plot([], [], linestyle='--', label="GT pitch_r")
-        self.l_ratt_y_gt, = self.ax_ratt.plot([], [], linestyle='--', label="GT yaw_r")
+
+        # roll=C0, pitch=C1, yaw=C2
+        # EKF estimates (solid)
+        self.l_ratt_r_est, = self.ax_ratt.plot([], [], label="EKF roll_r",  color='C0', linestyle='-')
+        self.l_ratt_p_est, = self.ax_ratt.plot([], [], label="EKF pitch_r", color='C1', linestyle='-')
+        self.l_ratt_y_est, = self.ax_ratt.plot([], [], label="EKF yaw_r",   color='C2', linestyle='-')
+        # Ground truth (dashed, same colors)
+        self.l_ratt_r_gt,  = self.ax_ratt.plot([], [], label="GT roll_r",   color='C0', linestyle='--')
+        self.l_ratt_p_gt,  = self.ax_ratt.plot([], [], label="GT pitch_r",  color='C1', linestyle='--')
+        self.l_ratt_y_gt,  = self.ax_ratt.plot([], [], label="GT yaw_r",    color='C2', linestyle='--')
+
         self.ax_ratt.grid(True)
         self.ax_ratt.legend(loc='best')
 
@@ -371,6 +386,7 @@ class EKFDebugPlotter(Node):
             plt.show(block=False)
         except Exception:
             pass
+
 
     def _on_plot_timer(self):
         try:
