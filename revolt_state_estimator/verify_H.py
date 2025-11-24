@@ -121,7 +121,7 @@ R_WI = Rzyx(roll, pitch, yaw)
 v_W  = np.array([[ 1.20], [-0.30], [ 0.50]])   # m/s in world
 w_I  = np.array([[ 0.2], [-0.1], [ 0.5]])  # rad/s in IMU/body
 p_IR = np.array([[ 0.07872], [-0.02159], [ 0.05919]])   # radar lever arm (I-frame)
-R_RI = Rzyx(0, 0.8, 0)                               # IMU->Radar (identity for test)
+R_RI = Rzyx(0.4, 0.8, 0.1)                               # IMU->Radar (identity for test)
 mu_r = np.array([[0.4],[0.6],[0.7]])
 mu_r = mu_r / np.linalg.norm(mu_r)
 
@@ -132,7 +132,7 @@ print("Analytic H:\n", H_a)
 print("Numeric  H:\n", H_n)
 print("Diff      :\n", H_n - H_a)
 print("Max|diff| :", np.max(np.abs(H_n - H_a)))
-print("Blocks (should be ~0 except dv, dθ, dbg):")
+print("Blocks (should be ~0 except d, dθ, dbg):")
 print("  d/dp   :", np.linalg.norm(H_n[0,0:3]))
 print("  d/dv   :", np.linalg.norm(H_n[0,3:6] - H_a[0,3:6]))
 print("  d/dba  :", np.linalg.norm(H_n[0,6:9]))

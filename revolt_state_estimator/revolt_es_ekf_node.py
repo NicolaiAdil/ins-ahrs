@@ -456,7 +456,7 @@ class RevoltEKF(Node):
         # Publish the state estimate
         t1 = self.get_clock().now()
         diff_time = t1 - t0
-        self.get_logger().info(f"EKF IMU callback time: {diff_time.nanoseconds * 1e-6:.3f} ms")
+        # self.get_logger().info(f"EKF IMU callback time: {diff_time.nanoseconds * 1e-6:.3f} ms")
 
         msg_stamp = rclpy.time.Time(
             seconds=msg.header.stamp.sec,
@@ -513,7 +513,7 @@ class RevoltEKF(Node):
         H[0, 12:15] = -(mu_r.reshape(1,3) @ (R_RI @ _skew(p_IR.flatten())))
         # self.get_logger().info(f"Radar H b_g: {H[0,12:15]}")
 
-        # d e / d ϕθψ = - μ^T R_RI [ R_IW v_W + (w_I)× p_IR ]_x   (Eq. 10)
+        # d e / d ϕθψ = - μ^T R_RI [ R_IW v_W]_x   (Eq. 10)
         v_I = R_IW @ v_WI                     # (IRW WvWI)
         S = -(mu_r.reshape(1,3) @ (R_RI @ _skew(v_I.flatten())))   # shape (1,3)
         H[0, 9:12] = S
@@ -521,7 +521,7 @@ class RevoltEKF(Node):
         # d e / d p_IR
         H[0, 15:18] = -(mu_r.reshape(1,3) @ (R_RI @ ( _skew((w_imu).flatten()) ) ))
 
-        # d e / d b_g = 0
+        # d e / d theta_IR = 0
         H[0, 18:21] = -(mu_r.reshape(1,3) @ (R_RI @
                                         (
                                         _skew(R_RI @ (v_I.flatten() + np.cross(w_imu.flatten(), p_IR.flatten())))
