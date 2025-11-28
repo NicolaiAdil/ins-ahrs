@@ -27,6 +27,8 @@ from geometry_msgs.msg import (
     QuaternionStamped,
 )
 import tf_transformations
+# from scipy.spatial.transform import Rotation
+
 import tf2_ros
 import numpy as np
 import scipy.linalg
@@ -282,7 +284,7 @@ class RevoltEKF(Node):
         # Publish radar position and attitude
         p_IR_msg = Vector3Stamped()
         p_IR_msg.header.stamp = stamp
-        p_IR_msg.header.frame_id = "body"
+        p_IR_msg.header.frame_id = "radar"
         p_IR_msg.vector.x = float(p_IR[0])
         p_IR_msg.vector.y = float(p_IR[1])
         p_IR_msg.vector.z = float(p_IR[2])
@@ -290,7 +292,7 @@ class RevoltEKF(Node):
 
         q_IR_msg = QuaternionStamped()
         q_IR_msg.header.stamp = stamp
-        q_IR_msg.header.frame_id = "body"
+        q_IR_msg.header.frame_id = "radar"
         q_IR_msg.quaternion.x = float(q_IR[0])
         q_IR_msg.quaternion.y = float(q_IR[1])
         q_IR_msg.quaternion.z = float(q_IR[2])
@@ -401,7 +403,7 @@ class RevoltEKF(Node):
 
             for vr, mu_r in zip(self.VR_meas, self.MU_R):
                 q = self.es_ekf.q_hat_ins.flatten()
-                R_WI = tf_transformations.quaternion_matrix(q)[:3, :3]  # R->NED
+                R_WI = tf_transformations.quaternion_matrix(q)[:3, :3]  # Inertial->World
                 v_WI = self.es_ekf.v_hat_ins.reshape(3,1)  # WvWI
 
                 p_IR = self.es_ekf.p_IR.reshape(3,1)
@@ -440,6 +442,7 @@ class RevoltEKF(Node):
                 self.es_ekf.update_state_estimate(delta_x_hat_i)
                 
                 self.es_ekf.P_hat_prior = self.es_ekf.P_hat.copy()
+                print(f"P_hat after radar update:\n{self.es_ekf.P_hat}")
                 self.es_ekf.delta_x_hat_prior = self.es_ekf.delta_x_hat.copy()
 
             self.i += 1
@@ -521,7 +524,7 @@ class RevoltEKF(Node):
         # d e / d p_IR
         H[0, 15:18] = -(mu_r.reshape(1,3) @ (R_RI @ ( _skew((w_imu).flatten()) ) ))
 
-        # d e / d theta_IR = 0
+        # d e / d theta_IR
         H[0, 18:21] = -(mu_r.reshape(1,3) @ (R_RI @
                                         (
                                         _skew(R_RI @ (v_I.flatten() + np.cross(w_imu.flatten(), p_IR.flatten())))
